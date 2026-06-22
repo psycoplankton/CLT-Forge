@@ -13,7 +13,7 @@ from typing import Union, Optional, Dict
 
 from clt_forge.config import CLTConfig
 from clt_forge.utils import DTYPE_MAP, CLT_WEIGHTS_FILENAME, CLT_CFG_FILENAME
-from clt_forge.training.optim import JumpReLU
+from clt_forge.training.optim import JumpReLU, fused_encoder
 from clt_forge import logger
 
 C_l0_COEF = 4
@@ -184,46 +184,38 @@ class CLT(nn.Module):
         output: tuple([B, N_layers, local_d_latent], [B, N_layers, local_d_latent]) if layer is None, else [B, local_d_latent]
         """
 
-        if layer is None: 
-            hidden_pre = (torch.einsum( # double check einsum and autocast
-                "bnd,ndk->bnk",
-                x,
-                self.W_enc,
-            ) + self.b_enc)
-
-            thresh = torch.exp(self.log_threshold) #shape [N_layers, d_latent]
-        else: 
-            assert 0 <= layer < self.N_layers, f"Layer {layer} out of range"
-            hidden_pre = F.linear(
-                x,
-                self.W_enc[layer].T,
-                self.b_enc[layer]
-            )            
-            thresh = torch.exp(self.log_threshold[layer]) 
-        
-        if self.cfg.activation_fn == "jumprelu":
-            feat_act = JumpReLU.apply(hidden_pre, thresh, self.bandwidth)
-        elif self.cfg.activation_fn == "topk":
-            assert self.cfg.k is not None, "k must be specified in config for topk activation"
-            k_val = min(self.cfg.k, hidden_pre.shape[-1])
-            preacts = F.relu(hidden_pre)
-            values, indices = torch.topk(preacts, k_val, dim=-1, sorted=False)
+        if self.cfg.activation_fn in ["topk", "groupmax"]:
+            assert self.cfg.k is not None, f"k must be specified in config for {self.cfg.activation_fn} activation"
+            if layer is None:
+                weight = self.W_enc
+                bias = self.b_enc
+            else:
+                assert 0 <= layer < self.N_layers, f"Layer {layer} out of range"
+                weight = self.W_enc[layer]
+                bias = self.b_enc[layer]
+            
+            values, indices, preacts = fused_encoder(x, weight, bias, self.cfg.k, self.cfg.activation_fn)
             feat_act = torch.zeros_like(preacts)
             feat_act.scatter_(-1, indices, values)
-        elif self.cfg.activation_fn == "groupmax":
-            assert self.cfg.k is not None, "k must be specified in config for groupmax activation"
-            k_val = self.cfg.k
-            num_latents = hidden_pre.shape[-1]
-            group_size = num_latents // k_val
-            preacts = F.relu(hidden_pre)
-            unflattened = preacts.unflatten(-1, (k_val, group_size))
-            values, local_indices = unflattened.max(dim=-1)
-            offsets = torch.arange(
-                0, num_latents, group_size, device=preacts.device
-            )
-            global_indices = local_indices + offsets
-            feat_act = torch.zeros_like(preacts)
-            feat_act.scatter_(-1, global_indices, values)
+            hidden_pre = preacts
+        elif self.cfg.activation_fn == "jumprelu":
+            if layer is None: 
+                hidden_pre = (torch.einsum(
+                    "bnd,ndk->bnk",
+                    x,
+                    self.W_enc,
+                ) + self.b_enc)
+                thresh = torch.exp(self.log_threshold)
+            else: 
+                assert 0 <= layer < self.N_layers, f"Layer {layer} out of range"
+                hidden_pre = F.linear(
+                    x,
+                    self.W_enc[layer].T,
+                    self.b_enc[layer]
+                )            
+                thresh = torch.exp(self.log_threshold[layer])
+            
+            feat_act = JumpReLU.apply(hidden_pre, thresh, self.bandwidth)
         else:
             raise ValueError(f"Unsupported activation_fn: {self.cfg.activation_fn}")
         return feat_act, hidden_pre
