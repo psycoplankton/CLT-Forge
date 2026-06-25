@@ -83,6 +83,9 @@ class CLTTrainingRunnerConfig(BaseModel):
     # -----Metrics----------------------------
     dead_feature_window: int = 250
     # n_eval_batches: int = 10
+    eval_step_size: Optional[int] = None
+    val_step_size: Optional[int] = None
+    tau_sweep_steps: int = 10
 
     # -----WANDB------------------------------
     log_to_wandb: bool = True
